@@ -111,5 +111,6 @@ class CardTitleConstants {
     'events': 'Events',
     'news': 'News',
     'weather': 'Weather',
+    'StaffInfoCard': 'Staff Information',
   };
 }
