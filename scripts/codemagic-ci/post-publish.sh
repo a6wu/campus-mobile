@@ -3,6 +3,7 @@ set -e
 echo "Start: post-publish.sh"
 cd ./scripts/codemagic-ci
 npm i
+pip3 install --target=./python_modules -r requirements.txt
 
 ENV_VARS=$( jq -n \
                   --arg fciBuildStepStatus "$FCI_BUILD_STEP_STATUS" \
@@ -17,7 +18,10 @@ ENV_VARS=$( jq -n \
                   --arg commitHash "$FCI_COMMIT" \
                   --arg prNumber "$FCI_PULL_REQUEST_NUMBER" \
                   --arg msTeamsWebhookUrl "$MS_TEAMS_WEBHOOK_URL" \
-                  '{fciBuildStepStatus: $fciBuildStepStatus, fciProjectId: $fciProjectId, fciBuildId: $fciBuildId, appVersion: $appVersion, buildPlatform: $buildPlatform, buildNumber: $buildNumber, buildEnv: $buildEnv, fciArtifactLinks: $fciArtifactLinks, buildBranch: $buildBranch, commitHash: $commitHash, prNumber: $prNumber, msTeamsWebhookUrl: $msTeamsWebhookUrl}' )
+                  --arg awsS3Bucket "$AWS_S3_BUCKET" \
+                  --arg awsRegion "$AWS_REGION" \
+                  --arg awsS3KeyPrefix "$AWS_S3_KEY_PREFIX" \
+                  '{fciBuildStepStatus: $fciBuildStepStatus, fciProjectId: $fciProjectId, fciBuildId: $fciBuildId, appVersion: $appVersion, buildPlatform: $buildPlatform, buildNumber: $buildNumber, buildEnv: $buildEnv, fciArtifactLinks: $fciArtifactLinks, buildBranch: $buildBranch, commitHash: $commitHash, prNumber: $prNumber, msTeamsWebhookUrl: $msTeamsWebhookUrl, awsS3Bucket: $awsS3Bucket, awsRegion: $awsRegion, awsS3KeyPrefix: $awsS3KeyPrefix}' )
 
 echo "Writing env-vars.json from \$ENV_VARS ..."
 echo $ENV_VARS > env-vars.json

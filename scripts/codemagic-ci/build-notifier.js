@@ -4,13 +4,127 @@ const moment = require('moment')
 const fs = require('fs')
 const XlsxTemplate = require('xlsx-template')
 const ENV_VARS = require('./env-vars.json')
-const SP_CONFIG = require('./sp-config.json')
 
 const INTERNAL_TIMEOUT = 20000
 const finalBuildNumber = parseInt(ENV_VARS.buildNumber) + 1000
 const teamsWebhookUrl = ENV_VARS.msTeamsWebhookUrl
 
 const getStringValue = (value) => (value === undefined || value === null) ? '' : String(value)
+const TEST_PLAN_PRESIGNED_URL_EXPIRES_SECONDS = 15 * 24 * 60 * 60
+
+const sanitizeS3KeyPart = (value) => getStringValue(value)
+	.replace(/[^a-zA-Z0-9._=-]+/g, '-')
+	.replace(/^-+|-+$/g, '')
+
+const buildTestPlanS3Key = (fileName) => {
+	const keyPrefix = getStringValue(ENV_VARS.awsS3KeyPrefix || 'codemagic-test-plans').replace(/^\/+|\/+$/g, '')
+	const buildSource = ENV_VARS.prNumber ? 'PR-' + ENV_VARS.prNumber : ENV_VARS.buildBranch
+	return [
+		keyPrefix,
+		sanitizeS3KeyPart(ENV_VARS.buildEnv),
+		sanitizeS3KeyPart(buildSource),
+		fileName,
+	].filter(Boolean).join('/')
+}
+
+const uploadTestPlanToS3 = (testPlanFilename) => {
+	try {
+		if (!testPlanFilename) {
+			console.log('S3 upload skipped: test plan filename unavailable')
+			return null
+		}
+
+		if (!ENV_VARS.awsS3Bucket) {
+			console.log('S3 upload skipped: AWS_S3_BUCKET unavailable')
+			return null
+		}
+
+		const uploadOptions = {
+			bucket: ENV_VARS.awsS3Bucket,
+			region: ENV_VARS.awsRegion,
+			key: buildTestPlanS3Key(testPlanFilename),
+			filePath: testPlanFilename,
+			fileName: testPlanFilename,
+			expiresIn: TEST_PLAN_PRESIGNED_URL_EXPIRES_SECONDS,
+		}
+
+		console.log('Uploading test plan to S3 bucket `' + uploadOptions.bucket + '` as `' + uploadOptions.key + '`...')
+		const pythonProcess = spawnSync('python3', ['upload-test-plan-s3.py', JSON.stringify(uploadOptions)], { encoding: 'utf8' })
+
+		if (pythonProcess.stderr) {
+			console.log(pythonProcess.stderr)
+		}
+
+		if (pythonProcess.status != 0) {
+			console.log('Uploading test plan to S3 failed')
+			if (pythonProcess.stdout) {
+				console.log(pythonProcess.stdout)
+			}
+			return null
+		}
+
+		const uploadResult = JSON.parse(pythonProcess.stdout)
+		console.log('Uploading test plan to S3 succeeded')
+		console.log('Test plan S3 object key: ' + uploadResult.key)
+		return uploadResult
+	} catch (err) {
+		console.log(err)
+		return null
+	}
+}
+
+
+const getS3KeyPrefix = (defaultPrefix) => getStringValue(ENV_VARS.awsS3KeyPrefix || defaultPrefix).replace(/^\/+|\/+$/g, '')
+
+const buildTemplateS3Key = (templateFilename) => [
+	getS3KeyPrefix('codemagic-test-plans'),
+	'Templates',
+	templateFilename,
+].filter(Boolean).join('/')
+
+const downloadTestPlanTemplateFromS3 = (templateFilename) => {
+	try {
+		if (!ENV_VARS.awsS3Bucket) {
+			throw 'Error: AWS_S3_BUCKET unavailable for test plan template download'
+		}
+
+		const downloadOptions = {
+			bucket: ENV_VARS.awsS3Bucket,
+			region: ENV_VARS.awsRegion,
+			key: buildTemplateS3Key(templateFilename),
+			destination: templateFilename,
+		}
+
+		console.log('Downloading test plan template from S3 bucket `' + downloadOptions.bucket + '` key `' + downloadOptions.key + '`...')
+		const pythonProcess = spawnSync('python3', ['download-test-plan-template-s3.py', JSON.stringify(downloadOptions)], { encoding: 'utf8' })
+
+		if (pythonProcess.stderr) {
+			console.log(pythonProcess.stderr)
+		}
+
+		if (pythonProcess.status != 0) {
+			if (pythonProcess.stdout) {
+				console.log(pythonProcess.stdout)
+			}
+			throw 'Error: Downloading test plan template from S3 failed'
+		}
+
+		return templateFilename
+	} catch (err) {
+		throw err
+	}
+}
+
+const getTestPlanTemplatePath = (planType, buildEnv, buildPlatform) => {
+	const normalizedPlatform = buildPlatform === 'IOS' ? 'iOS' : 'Android'
+	const normalizedEnv = ['PROD', 'PROD-TEST'].includes(buildEnv) ? buildEnv : 'QA'
+	const templateFilename = planType === 'pr' ?
+		'PR-Test-Plan-Template-' + normalizedPlatform + '-QA.xlsx' :
+		'Regression-Test-Plan-Template-' + normalizedPlatform + '-' + normalizedEnv + '.xlsx'
+
+	return downloadTestPlanTemplateFromS3(templateFilename)
+}
+
 const isUrl = (value) => typeof value === 'string' && /^https?:\/\//.test(value)
 
 const findArtifactLink = (artifactLinks, artifactFilename) => {
@@ -202,7 +316,7 @@ const buildNotify = async () => {
 			teamsFacts.push({ 'title': 'Testing:', 'value': testPlanFilename })
 			teamsActions.push({
 				'type': 'Action.OpenUrl',
-				'title': 'Open Test Plan',
+				'title': 'Download Test Plan (expires in 15 days)',
 				'url': testPlanUrl,
 			})
 		}
@@ -253,42 +367,14 @@ const generateTestPlan = async (prAuthor) => {
 		if (ENV_VARS.prNumber) {
 			console.log('Generating test plan for PR ' + ENV_VARS.prNumber)
 			testPlanFilename = 'PR-' + ENV_VARS.prNumber + '-Test-Plan-' + ENV_VARS.appVersion + '-' + ENV_VARS.buildEnv + '-' + finalBuildNumber + '.xlsx'
-			testPlanUrl = (SP_CONFIG.spSiteUrl + SP_CONFIG.spPullRequestTestFolderLink + testPlanFilename + '?web=1').replace(/ /g, '%20')
-			console.log('  (1/3) Downloading PR test plan template ...')
-			if (ENV_VARS.buildPlatform === 'IOS') {
-				fs.copyFileSync(SP_CONFIG.prTestPlanTemplateUrlIos, testPlanFilename)
-			} else if (ENV_VARS.buildPlatform === 'ANDROID') {
-				fs.copyFileSync(SP_CONFIG.prTestPlanTemplateUrlAndroid, testPlanFilename)
-			}
+			console.log('  (1/3) Downloading PR test plan template from S3 ...')
+			fs.copyFileSync(getTestPlanTemplatePath('pr', ENV_VARS.buildEnv, ENV_VARS.buildPlatform), testPlanFilename)
 		} else {
 			console.log('Generating regression test plan for branch ' + ENV_VARS.buildBranch)
 			testPlanFilename = 'Regression-Test-Plan-' + ENV_VARS.appVersion + '-' + ENV_VARS.buildEnv + '-' + finalBuildNumber + '.xlsx'
-			testPlanUrl = (SP_CONFIG.spSiteUrl + SP_CONFIG.spRegressionTestFolderLink + testPlanFilename + '?web=1').replace(/ /g, '%20')
-			switch(ENV_VARS.buildEnv) {
-				case 'PROD':
-					console.log('  (1/3) Downloading PROD regression test plan template ...')
-					if (ENV_VARS.buildPlatform === 'IOS') {
-						fs.copyFileSync(SP_CONFIG.prodRegressionTestPlanTemplateUrlIos, testPlanFilename)
-					} else if (ENV_VARS.buildPlatform === 'ANDROID') {
-						fs.copyFileSync(SP_CONFIG.prodRegressionTestPlanTemplateUrlAndroid, testPlanFilename)
-					}
-					break
-				case 'PROD-TEST':
-					console.log('  (1/3) Downloading PROD-TEST regression test plan template ...')
-					if (ENV_VARS.buildPlatform === 'IOS') {
-						fs.copyFileSync(SP_CONFIG.prodtestRegressionTestPlanTemplateUrlIos, testPlanFilename)
-					} else if (ENV_VARS.buildPlatform === 'ANDROID') {
-						fs.copyFileSync(SP_CONFIG.prodtestRegressionTestPlanTemplateUrlAndroid, testPlanFilename)
-					}
-					break
-				default:
-					console.log('  (1/3) Downloading QA regression test plan template ...')
-					if (ENV_VARS.buildPlatform === 'IOS') {
-						fs.copyFileSync(SP_CONFIG.qaRegressionTestPlanTemplateUrlIos, testPlanFilename)
-					} else if (ENV_VARS.buildPlatform === 'ANDROID') {
-						fs.copyFileSync(SP_CONFIG.qaRegressionTestPlanTemplateUrlAndroid, testPlanFilename)
-					}
-			}
+			const regressionTemplateEnv = ['PROD', 'PROD-TEST'].includes(ENV_VARS.buildEnv) ? ENV_VARS.buildEnv : 'QA'
+			console.log('  (1/3) Downloading ' + regressionTemplateEnv + ' regression test plan template from S3 ...')
+			fs.copyFileSync(getTestPlanTemplatePath('regression', regressionTemplateEnv, ENV_VARS.buildPlatform), testPlanFilename)
 		}
 
 		console.log('  (2/4) Making replacements ...')
@@ -314,17 +400,10 @@ const generateTestPlan = async (prAuthor) => {
 			'base64'
 		))
 
-		console.log('(4/4) Uploading test plan for build ' + finalBuildNumber)
-		const fileOptions = {
-			folder: ENV_VARS.prNumber ? SP_CONFIG.spPullRequestTestFolder : SP_CONFIG.spRegressionTestFolder,
-			fileName: testPlanFilename,
-		}
-		console.log('trying to upload' + fileOptions.fileName + 'to' + fileOptions.folder )
-		const pythonProcess = spawnSync('python', ['upload-build.py', SP_CONFIG.spSiteUrl, JSON.stringify(SP_CONFIG.credentials), JSON.stringify(fileOptions)], { stdio: 'inherit' })
-		if (pythonProcess.status == 0) {
-			console.log('Uploading test succeeded')
-		} else {
-			console.log('Uploading test failed')
+		console.log('(4/4) Uploading test plan to S3 for build ' + finalBuildNumber)
+		const testPlanUpload = uploadTestPlanToS3(testPlanFilename)
+		if (testPlanUpload && testPlanUpload.url) {
+			testPlanUrl = testPlanUpload.url
 		}
 		return {
 			testPlanFilename: testPlanFilename,
